@@ -196,15 +196,15 @@ class MAML:
               validloader,
               criterion,
               print_every=25,
-              valid_batch_verbose=True
+              validate_every=50,
               ):
         '''
         trains the model using MAML finetuning
 
         Parameters:
         -----------
-        support_dataset: nn.Tensor - support dataset batch
-        query_dataset: nn.Tensor - query dataset batch 
+        trainloader: list - contains Tensors of task batches
+        validloader: list - contains Tensors of task batches 
         criterion: callable - loss function
         epochs: int - number of training iterations
 
@@ -219,12 +219,15 @@ class MAML:
         targetModel = self.model_class()
         optimizer = SGD([*targetModel.parameters()], lr=self.outer_lr.item())
 
-        pre_outer_batch_loss_memo = []
-        accuracies_inner_support_batch_memo = []
-        loss_inner_support_batch_memo = []
-        pre_accuracy_query_batch_memo = []
-        post_outer_loss_batch_memo = []
-        post_accuracy_query_batch_memo = []
+        # pre adaptation support batch loss and accuracy memo
+        pre_adapt_support_batch_acc_memo = []
+        pre_adapt_query_batch_loss_memo = []
+        # pre adaptation query batch loss and accuracy memo
+        pre_adapt_query_batch_acc_memo = []
+        pre_adapt_query_batch_loss_memo = []
+        # post adaptation query batch loss and accuracy memo
+        post_adapt_query_batch_acc_memo = []
+        post_adapt_query_batch_loss_memo = []
 
         # put model on active device
         device = 'cuda' if torch.cuda.is_available else 'cpu'
@@ -234,17 +237,19 @@ class MAML:
 
         for i, task_batch in tqdm(enumerate(trainloader)):
 
-            pre_outer_batch_loss = []
-            accuracies_inner_support_batch = []
-            loss_inner_support_batch = []
-            pre_accuracy_query_batch = []
-            post_outer_loss_batch = []
-            post_accuracy_query_batch = []
-
-            # clone models
+            # pre adaptation support batch losses and accs (for each batch)
+            pre_adapt_support_batch_acc = []
+            pre_adapt_support_batch_loss = []
+            # pre adaptation query batch losses and accs (for each batch)
+            pre_adapt_query_batch_acc = []
+            pre_adapt_query_batch_loss = []
+            # post adaptation query batch losses and accs (for each batch)
+            post_adaptation_query_batch_loss = []
+            post_adaptation_query_batch_acc = []
 
             for images_s,  labels_s, images_q, labels_q in task_batch:
 
+                # clone models
                 self.__cloneModule(targetModel, fineTuneModel)
 
                 # putting data in device
@@ -262,11 +267,10 @@ class MAML:
                 loss = criterion(outs, labels_q)
 
                 # calculate pre-adaptation scores
-                pre_accuracy_query_batch.append(util.score(outs, labels_q))
-                pre_outer_batch_loss.append(loss.item())
-                accuracies_inner_support_batch.append(inner_support_accuracies)
-                loss_inner_support_batch.append(inner_support_loss)
-                # print('pre', next(iter(targetModel.parameters())))
+                pre_adapt_support_batch_acc.append(inner_support_accuracies)
+                pre_adapt_support_batch_loss.append(inner_support_loss)
+                pre_adapt_query_batch_acc.append(util.score(outs, labels_q))
+                pre_adapt_query_batch_loss.append(loss.item())
 
                 # update
                 optimizer.zero_grad()
@@ -283,47 +287,55 @@ class MAML:
                                  images_q, labels_q)
                 outs = fineTuneModel(images_q)
                 loss = criterion(outs, labels_q)
-                post_accuracy_query_batch.append(
+                post_adaptation_query_batch_acc.append(
                     util.score(outs, labels_q))
-                post_outer_loss_batch.append(loss.item())
+                post_adaptation_query_batch_loss.append(loss.item())
 
                 # @TODO take the best model according to the query error minimization
 
             if (i % print_every) == 0:
                 # inner scores
-                accuracies_inner_support_batch = np.mean(
-                    accuracies_inner_support_batch)
-                loss_inner_support_batch = np.mean(loss_inner_support_batch)
-                accuracies_inner_support_batch_memo.append(
-                    accuracies_inner_support_batch)
-                loss_inner_support_batch_memo.append(loss_inner_support_batch)
+                pre_adapt_support_batch_acc = np.mean(
+                    pre_adapt_support_batch_acc)
+                pre_adapt_support_batch_loss = np.mean(
+                    pre_adapt_support_batch_loss)
+                pre_adapt_support_batch_acc_memo.append(
+                    pre_adapt_support_batch_acc)
+                pre_adapt_query_batch_acc_memo.append(
+                    pre_adapt_support_batch_loss)
 
                 # pre adaptation outer scores
-                pre_accuracy_query_batch = np.mean(pre_accuracy_query_batch)
-                pre_outer_batch_loss = np.mean(pre_outer_batch_loss)
-                pre_accuracy_query_batch_memo.append(pre_accuracy_query_batch)
-                pre_outer_batch_loss_memo.append(pre_outer_batch_loss)
+                pre_adapt_query_batch_acc = np.mean(pre_adapt_query_batch_acc)
+                pre_adapt_query_batch_loss = np.mean(
+                    pre_adapt_query_batch_loss)
+                pre_adapt_query_batch_loss_memo.append(
+                    pre_adapt_query_batch_acc)
+                pre_adapt_query_batch_loss_memo.append(
+                    pre_adapt_query_batch_loss)
 
                 # post adaptations outer scores
-                post_accuracy_query_batch = np.mean(post_accuracy_query_batch)
-                post_outer_loss_batch = np.mean(post_outer_loss_batch)
-                post_accuracy_query_batch_memo.append(
-                    post_accuracy_query_batch)
-                post_outer_loss_batch_memo.append(post_outer_loss_batch)
+                post_adaptation_query_batch_acc = np.mean(
+                    post_adaptation_query_batch_acc)
+                post_adaptation_query_batch_loss = np.mean(
+                    post_adaptation_query_batch_loss)
+                post_adapt_query_batch_loss_memo.append(
+                    post_adaptation_query_batch_acc)
+                post_adapt_query_batch_acc_memo.append(
+                    post_adaptation_query_batch_loss)
 
                 # verbose message
                 message = f'''
                 [+ Training Log @ iter{i}]----------------------------
-                [Inner Scores]
-                -Inner support query accuracy score =\t{accuracies_inner_support_batch}
-                -Inner support query loss=\t{loss_inner_support_batch}
+                [Pre-Adaptation]
+                -Pre-support accuracy score =\t{pre_adapt_support_batch_acc}
+                -Pre-support loss=\t{pre_adapt_support_batch_loss}
                 [Pre-Adaptation Scores]
-                -outer query accuracy score =\t{pre_accuracy_query_batch}
-                -outer query loss =\t{pre_outer_batch_loss}
+                -outer query accuracy score =\t{pre_adapt_query_batch_acc}
+                -outer query loss =\t{pre_adapt_query_batch_loss}
                 ||-----[After Meta training]--->>
                 [Post-Adaptation Scores]
-                -outer query accuracy score =\t{post_accuracy_query_batch}
-                -outer query loss =\t{post_outer_loss_batch}
+                -outer query accuracy score =\t{post_adaptation_query_batch_acc}
+                -outer query loss =\t{post_adaptation_query_batch_loss}
                 '''
                 print(message)
 
