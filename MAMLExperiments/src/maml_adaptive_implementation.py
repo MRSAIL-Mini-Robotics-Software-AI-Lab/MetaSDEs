@@ -27,7 +27,7 @@ from dataloaders import trainloader, validloader, testloader
 
 import util
 
-from models import simpleNet
+from models import simpleNet, ResNet
 
 
 class MAML:
@@ -141,6 +141,8 @@ class MAML:
         fineTuneModel = self.model_class()
         targetModel = self.model_class()
         optimizer = SGD([*targetModel.parameters()], lr=self.outer_lr.item())
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=10, gamma=0.9)
 
         # pre adaptation support batch loss and accuracy memo
         support_batch_acc_memo = []
@@ -227,6 +229,12 @@ class MAML:
 
                 post_adaptation_query_batch_loss.append(loss.item())
 
+            # scheduled learning rate update
+            scheduler.step()
+
+            if i % 10 == 0:
+                self.inner_lr = self.inner_lr*0.9
+
             if (i % print_every) == 0:
                 # support batch scores
                 support_batch_acc = np.mean(
@@ -261,6 +269,9 @@ class MAML:
                 # verbose message
                 message = f'''
                 [+ Training Log @ iter {i}]----------------------------
+                [Learning Rates]
+                inner LR: {self.inner_lr}
+                outer LR: {scheduler.get_lr()}
                 [Inner Support Scores]----
                 -support accuracy=\t{support_batch_acc or 'Not supported in generative mode'}
                 -support loss=\t{support_batch_loss}
@@ -402,7 +413,7 @@ class MAML:
 
 
 if __name__ == "__main__":
-    model = MAML(2, 1, 1, lambda: simpleNet(5))
+    model = MAML(2, 1, 1.2, lambda: ResNet(1, 5))
     # model = MAML(2, 1e-3, 1, lambda: simpleNet(5))
     model.train(trainloader=trainloader,
-                validloader=validloader, print_every=2, print_valid_every=2, generative=False, pth_filepath='./m.pth')
+                validloader=validloader, print_every=2, print_valid_every=2, generative=False, pth_filepath='./resnet_5way_5shot_ca_lr_sched.pth')
