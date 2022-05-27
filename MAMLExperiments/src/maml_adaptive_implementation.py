@@ -26,6 +26,8 @@ from torch.utils import tensorboard
 import util
 import omniglot
 
+from models import simpleNet
+
 BATCH_SIZE = 16
 NUM_WAY = 5
 NUM_SUPPORT = 1
@@ -60,57 +62,6 @@ dataloader_test = omniglot.get_omniglot_dataloader(
     NUM_QUERY,
     NUM_TEST_TASKS
 )
-
-NUM_INPUT_CHANNELS = 1
-NUM_HIDDEN_CHANNELS = 64
-KERNEL_SIZE = 3
-NUM_CONV_LAYERS = 4
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-SUMMARY_INTERVAL = 10
-SAVE_INTERVAL = 100
-LOG_INTERVAL = 10
-VAL_INTERVAL = LOG_INTERVAL * 5
-NUM_TEST_TASKS = 600
-
-
-class simpleNet(nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
-        self.conv1 = nn.Conv2d(
-            NUM_INPUT_CHANNELS, NUM_HIDDEN_CHANNELS, KERNEL_SIZE)
-        self.conv2 = nn.Conv2d(NUM_HIDDEN_CHANNELS,
-                               NUM_HIDDEN_CHANNELS, KERNEL_SIZE)
-        self.conv3 = nn.Conv2d(NUM_HIDDEN_CHANNELS,
-                               NUM_HIDDEN_CHANNELS, KERNEL_SIZE)
-        self.conv4 = nn.Conv2d(NUM_HIDDEN_CHANNELS,
-                               NUM_HIDDEN_CHANNELS, KERNEL_SIZE)
-        self.linear = nn.Linear(NUM_HIDDEN_CHANNELS, num_classes)
-
-    def forward(self, x):
-        x = self.conv1.forward(x)
-        x = F.batch_norm(x, None, None, training=True)
-        x = F.relu(x)
-
-        x = self.conv2.forward(x)
-        x = F.batch_norm(x, None, None, training=True)
-        x = F.relu(x)
-
-        x = self.conv3.forward(x)
-        x = F.batch_norm(x, None, None, training=True)
-        x = F.relu(x)
-
-        x = self.conv4.forward(x)
-        x = F.batch_norm(x, None, None, training=True)
-        x = F.relu(x)
-
-        x = torch.mean(x, dim=[2, 3])
-
-        x = self.linear.forward(x)
-
-        return x
-
-    def loss(self, images, labels):
-        return F.cross_entropy(self.forward(images), labels)
 
 
 class MAML:
@@ -197,7 +148,8 @@ class MAML:
               trainloader,
               validloader,
               print_every=25,
-              validate_every=50,
+              print_valid_every=50,
+              pth_filepath='./finetuned_model.pth'
               ):
         '''
         trains the model using MAML finetuning
@@ -236,6 +188,9 @@ class MAML:
         fineTuneModel = fineTuneModel.to(device)
         targetModel = targetModel.to(device)
 
+        # model parameters tracking
+        best_query_valid_loss = np.Inf
+
         for i, task_batch in tqdm(enumerate(trainloader)):
 
             # pre adaptation support batch losses and accs (for each batch)
@@ -253,7 +208,7 @@ class MAML:
                 # clone models
                 self.__cloneModule(targetModel, fineTuneModel)
 
-                # putting data in device
+                # putting data in device and setting training mode
                 targetModel.train()
                 fineTuneModel.train()
 
@@ -277,7 +232,6 @@ class MAML:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                # print('post', next(iter(targetModel.parameters())))
 
                 # calculate post-adaptation scores
                 targetModel.eval()
@@ -291,8 +245,6 @@ class MAML:
                 post_adaptation_query_batch_acc.append(
                     util.score(outs, labels_q))
                 post_adaptation_query_batch_loss.append(loss.item())
-
-                # @TODO take the best model according to the query error minimization
 
             if (i % print_every) == 0:
                 # support batch scores
@@ -340,10 +292,42 @@ class MAML:
                 '''
                 print(message)
 
+            # Model Validation
+            # @NOTE clone the target model into the finetune model and insert it into this function to manipulate it
+            self.__cloneModule(targetModel, fineTuneModel)
+            valid_losses = self.validateModel(
+                fineTuneModel, validloader, generative=False)
+
+            if valid_losses['valid_post_adapt_query_loss'] < best_query_valid_loss:
+                message = f'''
+                ---
+                [+Prompt message] Valid query loss decreased {best_query_valid_loss} --> {valid_losses['valid_post_adapt_query_loss']} 
+                 so saving new model in {pth_filepath}
+                ---
+                '''
+                torch.save(targetModel.state_dict(), pth_filepath)
+                best_query_valid_loss = valid_losses['valid_post_adapt_query_loss']
+                print(message)
+
+            if i % print_valid_every == 0:
+                message = f'''
+                ------------------------------------
+                ------------[Validation]------------
+                ------------------------------------
+                [Inner Support Scores]----
+                -support accuracy=\t{valid_losses['valid_support_acc']}
+                -support loss=\t{valid_losses['valid_support_loss']}
+                ||-----[After Meta training]--->>
+                [Post-Adaptation Query Scores]----
+                -accuracy =\t{valid_losses['valid_post_adapt_query_acc']}
+                -loss =\t{valid_losses['valid_post_adapt_query_loss']}
+                '''
+                print(message)
+
         self.targetModel = targetModel
         return targetModel
 
-    def validateModel(self, model, validloader, criterion, valid_batch_verbose=True):
+    def validateModel(self, valid_model, validloader, generative=False):
         '''
         validates input data
 
@@ -351,80 +335,79 @@ class MAML:
         ----------
         model: model object -  meta trained model
         validloader: iter - torch validation loader
-        criterion: callable - criterion function
 
         Returns
         ------
         losses: dict - dictionary of losses (averaged on all batches)  {
-            'valid_loss_inner': float,
-            'valid_support_loss_before_inner':float,
-            'valid_support_loss_after_inner':float,
-            'valid_query_loss_before_inner': float,
-            'valid_query_loss_after_inner': float
+            'valid_support_acc': ...,
+            'valid_support_loss': ...,
+            'valid_post_adapt_query_acc': ...,
+            'valid_post_adapt_query_loss': ...,
         }
         '''
-        valid_model = deepcopy(model)
-        valid_model.train()
+        # pre adaptation support batch loss and accuracy memo
+        valid_support_batch_acc_memo = [] if not generative else None
+        valid_support_batch_loss_memo = []
+        # post adaptation query batch loss and accuracy memo
+        valid_post_adapt_query_batch_acc_memo = [] if not generative else None
+        valid_post_adapt_query_batch_loss_memo = []
 
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-        losses = {
-            'valid_loss_inner': 0,
-            'valid_support_loss_before_inner': 0,
-            'valid_support_loss_after_inner': 0,
-            'valid_query_loss_before_inner': 0,
-            'valid_query_loss_after_inner': 0
-        }
+        valid_model = valid_model.to(device)
 
-        for data in validloader:
-            for images_s,  labels_s, images_q, labels_q in data:
+        for task_batch in validloader:
+            # pre adaptation support batch losses and accs (for each batch)
+            valid_support_batch_acc = [] if not generative else None
+            valid_support_batch_loss = []
+            # post adaptation query batch losses and accs (for each batch)
+            valid_post_adaptation_query_batch_loss = []
+            valid_post_adaptation_query_batch_acc = [] if not generative else None
 
+            # validation
+            for images_s, labels_s, images_q, labels_q in task_batch:
                 images_s, labels_s = images_s.to(device), labels_s.to(device)
                 images_q, labels_q = images_q.to(device), labels_q.to(device)
 
-                # valid losses before inner
-                valid_model.eval()
-                with torch.no_grad():
-                    losses['valid_support_loss_before_inner'] += criterion(
-                        valid_model(images_s), labels_s)
-                    losses['valid_query_loss_before_inner'] += criterion(
-                        valid_model(images_q), labels_q)
+                _, inner_support_loss, inner_support_accuracies = self.__innerLoop(valid_model,
+                                                                                   images_s, labels_s)
+                if not generative:
+                    valid_support_batch_acc.append(inner_support_accuracies)
 
-                # training with the support images
-                valid_model.train()
+                valid_support_batch_loss.append(inner_support_loss)
 
-                _, loss_s_inner = self.__innerLoop(
-                    valid_model, criterion, images_s, labels_s)
-                losses['valid_loss_inner'] += loss_s_inner
+                loss = valid_model.loss(images_q, labels_q)
 
-                # valid losses after training
-                valid_model.eval()
-                with torch.no_grad():
-                    losses['valid_support_loss_after_inner'] += criterion(
-                        valid_model(images_s), labels_s)
-                    losses['valid_query_loss_after_inner'] += criterion(
-                        valid_model(images_q), labels_q)
+                valid_post_adaptation_query_batch_loss.append(loss.item())
 
-        losses['valid_loss_inner'] /= len(validloader)
-        losses['valid_support_loss_before_inner'] /= (
-            len(validloader)*images_s.shape[0])
-        losses['valid_query_loss_before_inner'] /= (
-            len(validloader)*images_q.shape[0])
-        losses['valid_support_loss_after_inner'] /= (
-            len(validloader)*images_s.shape[0])
-        losses['valid_query_loss_after_inner'] /= (
-            len(validloader)*images_q.shape[0])
+                if not generative:
+                    outs = valid_model.forward(images_q)
+                    valid_post_adaptation_query_batch_acc.append(
+                        util.score(outs, labels_q))
+            if not generative:
+                valid_support_batch_acc_memo.append(
+                    np.mean(valid_support_batch_acc))
+            else:
+                valid_support_batch_acc_memo = [0]
 
-        if valid_batch_verbose:
-            message = f'''
-            ---Validation Batch Results---
-            valid loss inner:\t\t{losses['valid_loss_inner']}
-            support loss outer before training:\t\t{losses['valid_support_loss_before_inner']}
-            support loss outer after training:\t\t{losses['valid_query_loss_before_inner']}
-            query loss before training:\t\t{losses['valid_support_loss_after_inner']}
-            query loss after training:\t\t{losses['valid_query_loss_after_inner']}
-            '''
-            print(message)
+            valid_support_batch_loss_memo.append(np.mean(
+                valid_support_batch_loss))
+
+            if not generative:
+                valid_post_adapt_query_batch_acc_memo.append(np.mean(
+                    valid_post_adaptation_query_batch_acc))
+            else:
+                valid_post_adapt_query_batch_acc_memo = [0]
+
+            valid_post_adapt_query_batch_loss_memo.append(np.mean(
+                valid_post_adaptation_query_batch_loss))
+
+        losses = {
+            'valid_support_acc': np.mean(valid_support_batch_acc_memo) or 'Not supported in generative mode',
+            'valid_support_loss': np.mean(valid_support_batch_loss_memo),
+            'valid_post_adapt_query_acc': np.mean(valid_post_adapt_query_batch_acc_memo) or 'Not supported in generative mode',
+            'valid_post_adapt_query_loss': np.mean(valid_post_adapt_query_batch_loss_memo),
+        }
 
         return losses
 
