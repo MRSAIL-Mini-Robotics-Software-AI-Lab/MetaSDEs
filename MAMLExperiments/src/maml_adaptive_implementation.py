@@ -112,6 +112,7 @@ class MAML:
         -----------
         model: nn.Module - cloned model
         labels: torch.Tensor - loss function
+        generative: bool - training mode
         '''
         # perform gradient updates
         model.train()
@@ -159,8 +160,10 @@ class MAML:
         -----------
         trainloader: list - contains Tensors of task batches
         validloader: list - contains Tensors of task batches 
-        criterion: callable - loss function
-        epochs: int - number of training iterations
+        print_every: int - training verbose rate
+        print_valid_every: int - validation verbose rate
+        pth_filepath: str - pth filepath to save the best trained model
+        generative: bool - training mode
 
         Returns:
         --------
@@ -338,7 +341,15 @@ class MAML:
                 print(message)
 
         self.targetModel = targetModel
-        return targetModel
+
+        return {
+            'support_acc': support_batch_acc_memo,
+            'support_loss': support_batch_loss_memo,
+            'pre_adapt_query_acc': pre_adapt_query_batch_acc_memo,
+            'pre_adapt_query_loss': pre_adapt_query_batch_loss_memo,
+            'post_adapt_query_acc': post_adapt_query_batch_acc_memo,
+            'post_adapt_query_loss': post_adapt_query_batch_loss_memo
+        }
 
     def validateModel(self, valid_model, validloader, generative=False):
         '''
@@ -348,6 +359,7 @@ class MAML:
         ----------
         model: model object -  meta trained model
         validloader: iter - torch validation loader
+        generative: bool - training mode
 
         Returns
         ------
