@@ -1,4 +1,4 @@
-"""Utilities for scoring the model.  credits goes to Stanford's CS330"""
+"""Utilities for scoring the model.  credits go to Stanford's CS330"""
 import torch
 
 
