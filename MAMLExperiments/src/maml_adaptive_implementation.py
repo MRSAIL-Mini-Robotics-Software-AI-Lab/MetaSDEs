@@ -104,7 +104,7 @@ class MAML:
         for target_child, instance_child in zip(target.children(), instance.children()):
             self.__cloneModule(target_child, instance_child)
 
-    def __innerLoop(self, model: nn.Module, images: torch.Tensor, labels: torch.Tensor = None) -> tuple:
+    def __innerLoop(self, model: nn.Module, images: torch.Tensor, labels: torch.Tensor = None, generative=False) -> tuple:
         '''
         performs a GD step update on a given model using the given loss fn
 
@@ -118,7 +118,7 @@ class MAML:
         device = labels.device
 
         for _ in range(self.inner_steps):
-            if labels is not None:
+            if not generative:
                 loss = model.loss(images, labels)
             else:
                 loss = model.loss(images)
@@ -133,7 +133,7 @@ class MAML:
             outs = model.forward(images)
             accuracy_inner = None
 
-            if labels is not None:
+            if not generative:
                 loss = model.loss(images, labels)
                 accuracy_inner = util.score(outs, labels)
             else:
@@ -149,7 +149,8 @@ class MAML:
               validloader,
               print_every=25,
               print_valid_every=50,
-              pth_filepath='./finetuned_model.pth'
+              pth_filepath='./finetuned_model.pth',
+              generative=False
               ):
         '''
         trains the model using MAML finetuning
@@ -216,16 +217,22 @@ class MAML:
                 images_q, labels_q = images_q.to(device), labels_q.to(device)
 
                 _, inner_support_loss, inner_support_accuracies = self.__innerLoop(
-                    fineTuneModel, images_s, labels_s)
+                    fineTuneModel, images_s, labels_s, generative=generative)
 
                 # outerloop and update
                 outs = fineTuneModel(images_q)
-                loss = fineTuneModel.loss(images_q, labels_q)
+
+                if not generative:
+                    loss = fineTuneModel.loss(images_q, labels_q)
+                    # append accuracies
+                    support_batch_acc.append(inner_support_accuracies)
+                    pre_adapt_query_batch_acc.append(
+                        util.score(outs, labels_q))
+                else:
+                    loss = fineTuneModel.loss(images_q)
 
                 # calculate pre-adaptation scores
-                support_batch_acc.append(inner_support_accuracies)
                 support_batch_loss.append(inner_support_loss)
-                pre_adapt_query_batch_acc.append(util.score(outs, labels_q))
                 pre_adapt_query_batch_loss.append(loss.item())
 
                 # update
@@ -239,17 +246,22 @@ class MAML:
                 self.__cloneModule(targetModel, fineTuneModel)
 
                 self.__innerLoop(fineTuneModel,
-                                 images_q, labels_q)
-                outs = fineTuneModel(images_q)
-                loss = fineTuneModel.loss(images_q, labels_q)
-                post_adaptation_query_batch_acc.append(
-                    util.score(outs, labels_q))
+                                 images_q, labels_q, generative=generative)
+
+                if not generative:
+                    outs = fineTuneModel(images_q)
+                    loss = fineTuneModel.loss(images_q, labels_q)
+                    post_adaptation_query_batch_acc.append(
+                        util.score(outs, labels_q))
+                else:
+                    loss = fineTuneModel.loss(images_q)
+
                 post_adaptation_query_batch_loss.append(loss.item())
 
             if (i % print_every) == 0:
                 # support batch scores
                 support_batch_acc = np.mean(
-                    support_batch_acc)
+                    support_batch_acc) if len(support_batch_acc) > 0 else 0
                 support_batch_loss = np.mean(
                     support_batch_loss)
                 support_batch_acc_memo.append(
@@ -258,7 +270,8 @@ class MAML:
                     support_batch_loss)
 
                 # pre adaptation query batch scores
-                pre_adapt_query_batch_acc = np.mean(pre_adapt_query_batch_acc)
+                pre_adapt_query_batch_acc = np.mean(pre_adapt_query_batch_acc) if len(
+                    pre_adapt_query_batch_acc) > 0 else 0
                 pre_adapt_query_batch_loss = np.mean(
                     pre_adapt_query_batch_loss)
                 pre_adapt_query_batch_acc_memo.append(
@@ -268,7 +281,7 @@ class MAML:
 
                 # post adaptations query batch scores
                 post_adaptation_query_batch_acc = np.mean(
-                    post_adaptation_query_batch_acc)
+                    post_adaptation_query_batch_acc) if len(post_adaptation_query_batch_acc) > 0 else 0
                 post_adaptation_query_batch_loss = np.mean(
                     post_adaptation_query_batch_loss)
                 post_adapt_query_batch_loss_memo.append(
@@ -280,14 +293,14 @@ class MAML:
                 message = f'''
                 [+ Training Log @ iter {i}]----------------------------
                 [Inner Support Scores]----
-                -support accuracy=\t{support_batch_acc}
+                -support accuracy=\t{support_batch_acc or 'Not supported in generative mode'}
                 -support loss=\t{support_batch_loss}
                 [Pre-Adaptation Query Scores]----
-                -accuracy =\t{pre_adapt_query_batch_acc}
+                -accuracy =\t{pre_adapt_query_batch_acc or 'Not supported in generative mode'}
                 -loss =\t{pre_adapt_query_batch_loss}
                 ||-----[After Meta training]--->>
                 [Post-Adaptation Query Scores]----
-                -accuracy =\t{post_adaptation_query_batch_acc}
+                -accuracy =\t{post_adaptation_query_batch_acc or 'Not supported in generative mode'}
                 -loss =\t{post_adaptation_query_batch_loss}
                 '''
                 print(message)
@@ -296,7 +309,7 @@ class MAML:
             # @NOTE clone the target model into the finetune model and insert it into this function to manipulate it
             self.__cloneModule(targetModel, fineTuneModel)
             valid_losses = self.validateModel(
-                fineTuneModel, validloader, generative=False)
+                fineTuneModel, validloader, generative=generative)
 
             if valid_losses['valid_post_adapt_query_loss'] < best_query_valid_loss:
                 message = f'''
@@ -370,33 +383,31 @@ class MAML:
                 images_q, labels_q = images_q.to(device), labels_q.to(device)
 
                 _, inner_support_loss, inner_support_accuracies = self.__innerLoop(valid_model,
-                                                                                   images_s, labels_s)
-                if not generative:
-                    valid_support_batch_acc.append(inner_support_accuracies)
-
+                                                                                   images_s, labels_s, generative=generative)
                 valid_support_batch_loss.append(inner_support_loss)
 
-                loss = valid_model.loss(images_q, labels_q)
-
-                valid_post_adaptation_query_batch_loss.append(loss.item())
-
                 if not generative:
+                    valid_support_batch_acc.append(inner_support_accuracies)
                     outs = valid_model.forward(images_q)
                     valid_post_adaptation_query_batch_acc.append(
                         util.score(outs, labels_q))
+                    loss = valid_model.loss(images_q, labels_q)
+                else:
+                    loss = valid_model.loss(images_q)
+
+                valid_post_adaptation_query_batch_loss.append(loss.item())
+
+            # updating memos
+            valid_support_batch_loss_memo.append(
+                np.mean(valid_support_batch_loss))
+
             if not generative:
                 valid_support_batch_acc_memo.append(
                     np.mean(valid_support_batch_acc))
-            else:
-                valid_support_batch_acc_memo = [0]
-
-            valid_support_batch_loss_memo.append(np.mean(
-                valid_support_batch_loss))
-
-            if not generative:
                 valid_post_adapt_query_batch_acc_memo.append(np.mean(
                     valid_post_adaptation_query_batch_acc))
             else:
+                valid_support_batch_acc_memo = [0]
                 valid_post_adapt_query_batch_acc_memo = [0]
 
             valid_post_adapt_query_batch_loss_memo.append(np.mean(
@@ -416,5 +427,4 @@ if __name__ == "__main__":
     model = MAML(2, 1, 1, lambda: simpleNet(5))
     # model = MAML(2, 1e-3, 1, lambda: simpleNet(5))
     model.train(trainloader=trainloader,
-                validloader=validloader, print_every=50)
-    torch.save(model.targetModel.state_dict(), 'targetModel.pth')
+                validloader=validloader, print_every=50, generative=False)
