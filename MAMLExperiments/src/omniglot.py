@@ -1,4 +1,4 @@
-"""Dataloading for Omniglot. credits goes to Stanford's CS330"""
+"""Dataloading for Omniglot. credits go to Stanford's CS330"""
 import os
 import glob
 
